@@ -54,7 +54,7 @@ pub mod task;
 use std::collections::{HashMap, HashSet};
 
 use sea_orm::sea_query::extension::postgres::PgExpr;
-use sea_orm::sea_query::{Alias, PgFunc, Query};
+use sea_orm::sea_query::{Alias, PgFunc, Query, SimpleExpr};
 use sea_orm::{prelude::*, FromQueryResult, QueryOrder, QuerySelect, Set, TransactionTrait};
 use uuid::Uuid;
 
@@ -872,21 +872,55 @@ pub async fn agent_heartbeat(
         .send(AgentHeartbeatOp::Heartbeat(agent_id));
 
     // The agent's own state wins: it is the authority on what it is doing.
-    let agent = Agent::Entity::update_many()
-        .col_expr(Agent::Column::State, Expr::value(req.state))
-        .col_expr(Agent::Column::LastHeartbeat, Expr::value(now))
-        .col_expr(Agent::Column::UpdatedAt, Expr::value(now))
-        .filter(Agent::Column::Id.eq(agent_id))
-        .exec_with_returning(&pool.db)
+    // Its suite is not: that is written only by the job transitions, and a
+    // mismatch here is a job one side closed without the other hearing of it.
+    // Read back in the same statement to save a round trip.
+    let recorded_suite_uuid = Query::select()
+        .column(TaskSuites::Column::Uuid)
+        .from(TaskSuites::Entity)
+        .and_where(
+            Expr::col((TaskSuites::Entity, TaskSuites::Column::Id))
+                .equals((Agent::Entity, Agent::Column::AssignedTaskSuiteId)),
+        )
+        .to_owned();
+    let stmt = Query::update()
+        .table(Agent::Entity)
+        .value(Agent::Column::State, req.state)
+        .value(Agent::Column::LastHeartbeat, now)
+        .value(Agent::Column::UpdatedAt, now)
+        .and_where(Expr::col(Agent::Column::Id).eq(agent_id))
+        .returning(Query::returning().expr(SimpleExpr::SubQuery(
+            None,
+            Box::new(recorded_suite_uuid.into_sub_query_statement()),
+        )))
+        .to_owned();
+    let recorded_suite_uuid: Option<Uuid> = pool
+        .db
+        .query_one(pool.db.get_database_backend().build(&stmt))
         .await?
-        .into_iter()
-        .next()
-        .ok_or(Error::ApiError(ApiError::NotFound("Agent".to_string())))?;
+        .ok_or(Error::ApiError(ApiError::NotFound("Agent".to_string())))?
+        .try_get_by_index(0)?;
+    match (recorded_suite_uuid, req.assigned_suite_uuid) {
+        (recorded, claimed) if recorded == claimed => {}
+        // `complete` releases the agent before its main loop reaps the run, so
+        // the heartbeat in between still names the suite it just finished.
+        (None, Some(claimed)) => tracing::debug!(
+            %agent_uuid,
+            claimed_suite_uuid = %claimed,
+            "Agent still claims a suite it has been released from"
+        ),
+        (recorded, claimed) => tracing::warn!(
+            %agent_uuid,
+            recorded_suite_uuid = ?recorded,
+            claimed_suite_uuid = ?claimed,
+            "Agent's suite does not match the one recorded for it"
+        ),
+    }
 
     // An idle agent with nothing assigned and work waiting gets a fresh nudge.
     // The suite it would land on is not named: it is re-picked in `accept`, and
     // by then a reservation may have moved the answer on.
-    if req.state == AgentState::Idle && agent.assigned_task_suite_id.is_none() {
+    if req.state == AgentState::Idle && recorded_suite_uuid.is_none() {
         let blocked = pool.suite_queues.blocked_for(agent_id);
         if matching::agent_has_available_suite(&pool.db, agent_id, &blocked).await? {
             AgentWsRouter::notify(
@@ -1457,32 +1491,6 @@ pub async fn agent_complete_job(
 
     let blocked = pool.suite_queues.blocked_for(agent_id);
     matching::agent_has_available_suite(&pool.db, agent_id, &blocked).await
-}
-
-/// Push a notification to every agent id in `agent_ids` (resolving uuids first).
-pub(crate) async fn notify_agents_by_id(
-    pool: &InfraPool,
-    agent_ids: &[i64],
-    event: AgentNotification,
-) {
-    if agent_ids.is_empty() {
-        return;
-    }
-    let uuids = Agent::Entity::find()
-        .select_only()
-        .column(Agent::Column::Uuid)
-        .filter(Agent::Column::Id.is_in(agent_ids.to_vec()))
-        .into_tuple::<Uuid>()
-        .all(&pool.db)
-        .await;
-    match uuids {
-        Ok(uuids) => {
-            for uuid in uuids {
-                AgentWsRouter::notify(&pool.ws_router_tx, uuid, event.clone());
-            }
-        }
-        Err(e) => tracing::error!("Failed to resolve agent uuids for notification: {e}"),
-    }
 }
 
 /// On coordinator start, tell the router what boot it is on. Agents learn the

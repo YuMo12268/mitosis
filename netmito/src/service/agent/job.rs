@@ -9,8 +9,8 @@ use sea_orm::{prelude::*, QueryOrder, QuerySelect, Set};
 use uuid::Uuid;
 
 use crate::entity::{
-    active_tasks as ActiveTasks,
-    state::{SuiteJobState, TaskState},
+    active_tasks as ActiveTasks, agents as Agent,
+    state::{AgentState, SuiteJobState, TaskState},
     suite_agent_jobs as SuiteAgentJobs, task_suites as TaskSuites,
 };
 use crate::error::{ApiError, Error, Result};
@@ -211,15 +211,19 @@ pub async fn terminate_agent_jobs<C: ConnectionTrait>(
     Ok(terminated.into_iter().map(|j| j.task_suite_id).collect())
 }
 
-/// Coordinator-written terminal: force-stop every in-flight job of a suite
-/// (`Killed`, no cleanup). Returns the agent ids whose jobs were stopped, so the
-/// caller can notify them.
+/// Coordinator-written terminal for a cancelled suite: force-stop every
+/// in-flight job (`Killed`, no cleanup) and release every agent still assigned
+/// to it. Returns the released agents' uuids, so the caller can notify them.
+///
+/// The release cannot be left to the agent: its `complete` is refused on a
+/// `Killed` job, so nothing else would ever clear the assignment. Run it in a
+/// transaction so the kill and the release land together.
 pub async fn kill_suite_jobs<C: ConnectionTrait>(
     db: &C,
     suite_id: i64,
     now: TimeDateTimeWithTimeZone,
-) -> Result<Vec<i64>> {
-    let killed = SuiteAgentJobs::Entity::update_many()
+) -> Result<Vec<Uuid>> {
+    SuiteAgentJobs::Entity::update_many()
         .col_expr(
             SuiteAgentJobs::Column::State,
             Expr::value(SuiteJobState::Killed),
@@ -227,22 +231,37 @@ pub async fn kill_suite_jobs<C: ConnectionTrait>(
         .col_expr(SuiteAgentJobs::Column::UpdatedAt, Expr::value(now))
         .filter(SuiteAgentJobs::Column::TaskSuiteId.eq(suite_id))
         .filter(SuiteAgentJobs::Column::State.is_in(IN_FLIGHT))
+        .exec(db)
+        .await?;
+
+    // Filtered on the suite rather than the killed jobs' agents, so no id list
+    // is bound: the suite is cancelled, so anything still assigned to it is
+    // stale, whether its job was killed just now or ended without the release.
+    let released = Agent::Entity::update_many()
+        .col_expr(Agent::Column::State, Expr::value(AgentState::Idle))
+        .col_expr(Agent::Column::AssignedTaskSuiteId, Expr::value(None::<i64>))
+        .col_expr(Agent::Column::UpdatedAt, Expr::value(now))
+        .filter(Agent::Column::AssignedTaskSuiteId.eq(suite_id))
         .exec_with_returning(db)
         .await?;
-    Ok(killed.into_iter().filter_map(|j| j.agent_id).collect())
+
+    Ok(released.into_iter().map(|agent| agent.uuid).collect())
 }
 
-/// The agent ids currently running an in-flight job of a suite.
-pub async fn agents_running_suite<C: ConnectionTrait>(db: &C, suite_id: i64) -> Result<Vec<i64>> {
-    let jobs = SuiteAgentJobs::Entity::find()
+/// The uuids of the agents currently running an in-flight job of a suite.
+pub async fn agents_running_suite<C: ConnectionTrait>(db: &C, suite_id: i64) -> Result<Vec<Uuid>> {
+    Ok(SuiteAgentJobs::Entity::find()
         .select_only()
-        .column(SuiteAgentJobs::Column::AgentId)
+        .column(Agent::Column::Uuid)
+        .join(
+            sea_orm::JoinType::InnerJoin,
+            SuiteAgentJobs::Relation::Agents.def(),
+        )
         .filter(SuiteAgentJobs::Column::TaskSuiteId.eq(suite_id))
         .filter(SuiteAgentJobs::Column::State.is_in(IN_FLIGHT))
-        .into_tuple::<Option<i64>>()
+        .into_tuple::<Uuid>()
         .all(db)
-        .await?;
-    Ok(jobs.into_iter().flatten().collect())
+        .await?)
 }
 
 /// Whether the agent owns any job that has not reached a terminal state.

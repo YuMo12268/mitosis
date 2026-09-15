@@ -725,6 +725,7 @@ impl AgentClient {
                     job_id,
                     cache_path: self.cache_path.join("job"),
                     job_token,
+                    shutdown_token: self.shutdown_token.clone(),
                     drain_token,
                     fetch_wake: self.fetch_wake.subscribe(),
                 };
@@ -884,6 +885,9 @@ struct SuiteRunner {
     /// Cancelled when the suite is cancelled, preempted, or the agent stops.
     /// Everything the job runs (tasks, hooks, cleanup) runs under it.
     job_token: CancellationToken,
+    /// The agent's shutdown. The only thing that stops a job report from being
+    /// retried, since a cancelled job still has to be reported.
+    shutdown_token: CancellationToken,
     /// Cancelled to stop claiming without stopping the wind-down: the tasks
     /// already executing finish and commit, then cleanup runs — under
     /// `job_token`, which is why the two are separate. Whatever a slot claimed
@@ -923,16 +927,7 @@ impl SuiteRunner {
             });
         }
 
-        if let Err(e) = self
-            .post_empty(
-                "agents/job",
-                &JobReportReq {
-                    job,
-                    op: JobReportOp::Start,
-                },
-            )
-            .await
-        {
+        if let Err(e) = self.report_job(job, JobReportOp::Start).await {
             tracing::error!("Failed to start suite {suite_uuid}: {e}");
         }
 
@@ -969,16 +964,7 @@ impl SuiteRunner {
             }
         }
 
-        if let Err(e) = self
-            .post_empty(
-                "agents/job",
-                &JobReportReq {
-                    job,
-                    op: JobReportOp::EnterCleanup,
-                },
-            )
-            .await
-        {
+        if let Err(e) = self.report_job(job, JobReportOp::EnterCleanup).await {
             tracing::error!("Failed to enter cleanup for suite {suite_uuid}: {e}");
         }
 
@@ -994,7 +980,11 @@ impl SuiteRunner {
             None => SuiteJobOutcome::Completed,
             Some(reason) => SuiteJobOutcome::Failed { reason },
         };
-        let next_available = match self.report_complete(job, outcome).await {
+        let next_available = match self
+            .report_job(job, JobReportOp::Complete { outcome })
+            .await
+            .map(|resp| resp.next_suite_available.unwrap_or(false))
+        {
             Ok(next_available) => {
                 tracing::info!(
                     "Finished suite {suite_uuid} (job {}); more work waiting: {next_available}",
@@ -1374,39 +1364,47 @@ impl SuiteRunner {
         parse_json(resp, "fetch tasks").await
     }
 
-    async fn report_complete(&self, job: i64, outcome: SuiteJobOutcome) -> Result<bool> {
-        let resp = self
-            .http_client
-            .post(self.api_url("agents/job").as_str())
-            .bearer_auth(&self.token)
-            .json(&JobReportReq {
-                job,
-                op: JobReportOp::Complete { outcome },
-            })
-            .send()
-            .await
-            .map_err(error::map_reqwest_err)?;
-        let resp: JobReportResp = parse_json(resp, "complete job").await?;
-        Ok(resp.next_suite_available.unwrap_or(false))
-    }
-
-    /// POST a request whose success carries no body.
-    async fn post_empty<T: serde::Serialize>(&self, path: &str, req: &T) -> Result<()> {
-        let resp = self
-            .http_client
-            .post(self.api_url(path).as_str())
-            .bearer_auth(&self.token)
-            .json(req)
-            .send()
-            .await
-            .map_err(error::map_reqwest_err)?;
-        if resp.status().is_success() {
-            return Ok(());
+    /// Report a job transition, retrying until the coordinator gives an answer
+    /// that settles it.
+    ///
+    /// The agent lets go of a job whether or not this lands, so a report that is
+    /// dropped leaves the coordinator holding the agent on a job forever. Unlike
+    /// task reports it therefore ignores `job_token`, and retries a 5xx as well
+    /// as a failed send, which is what a restarting coordinator answers. Only a
+    /// 4xx ends it: 400/404 mean the job is already closed or not ours (including
+    /// a `complete` whose first answer was lost), 401 that the agent is retired.
+    async fn report_job(&self, job: i64, op: JobReportOp) -> Result<JobReportResp> {
+        let url = self.api_url("agents/job");
+        let req = JobReportReq { job, op };
+        loop {
+            let resp = self
+                .http_client
+                .post(url.as_str())
+                .bearer_auth(&self.token)
+                .json(&req)
+                .send()
+                .await;
+            let failure = match resp {
+                Ok(resp) if resp.status().is_server_error() => {
+                    format!("coordinator answered {}", resp.status())
+                }
+                Ok(resp) => return parse_json(resp, "job report").await,
+                Err(e) if e.is_builder() => return Err(error::map_reqwest_err(e).into()),
+                Err(e) => e.to_string(),
+            };
+            tracing::warn!(
+                "Job report failed ({failure}); retrying in {:?}",
+                self.connect_retry_interval
+            );
+            tokio::select! {
+                _ = self.shutdown_token.cancelled() => {
+                    return Err(error::Error::Custom(format!(
+                        "job report abandoned on shutdown: {failure}"
+                    )));
+                }
+                _ = tokio::time::sleep(self.connect_retry_interval) => {}
+            }
         }
-        Err(error::Error::Custom(format!(
-            "{path} failed: {}",
-            error::get_error_from_resp(resp).await
-        )))
     }
 
     /// The hook's `ExecSpec` from the suite definition, if it has one.

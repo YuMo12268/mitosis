@@ -25,6 +25,7 @@ use crate::schema::{
     TaskSuiteQueryResp, TaskSuitesQueryReq, TaskSuitesQueryResp, UpdateOp, WorkerSchedulePlan,
 };
 use crate::service::task::{check_exec_spec, parse_operators_with_number, OperatorWithNumber};
+use crate::ws::AgentWsRouter;
 
 #[derive(FromQueryResult)]
 struct GroupIdResult {
@@ -1111,8 +1112,14 @@ pub async fn user_cancel_task_suite(
     // lets the agent walk it through cleanup to `Completed`.
     let running_agents = match op {
         CancelTaskSuiteOp::Force => {
-            let killed =
-                crate::service::agent::job::kill_suite_jobs(&pool.db, suite_id, now).await?;
+            let killed = pool
+                .db
+                .transaction::<_, Vec<Uuid>, Error>(move |txn| {
+                    Box::pin(async move {
+                        crate::service::agent::job::kill_suite_jobs(txn, suite_id, now).await
+                    })
+                })
+                .await?;
             // Every job of the suite is over at once, and the suite itself has
             // nothing left to hand out.
             pool.suite_queues.close_suite(suite_id);
@@ -1123,24 +1130,24 @@ pub async fn user_cancel_task_suite(
         }
     };
 
-    crate::service::agent::notify_agents_by_id(
-        pool,
-        &running_agents,
-        AgentNotification::SuiteCancelled {
-            suite_uuid,
-            reason: "Suite was cancelled by a user".to_string(),
-        },
-    )
-    .await;
-    if !cancelled_task_uuids.is_empty() {
-        crate::service::agent::notify_agents_by_id(
-            pool,
-            &running_agents,
-            AgentNotification::TasksCancelled {
-                task_uuids: cancelled_task_uuids,
+    for agent_uuid in running_agents {
+        AgentWsRouter::notify(
+            &pool.ws_router_tx,
+            agent_uuid,
+            AgentNotification::SuiteCancelled {
+                suite_uuid,
+                reason: "Suite was cancelled by a user".to_string(),
             },
-        )
-        .await;
+        );
+        if !cancelled_task_uuids.is_empty() {
+            AgentWsRouter::notify(
+                &pool.ws_router_tx,
+                agent_uuid,
+                AgentNotification::TasksCancelled {
+                    task_uuids: cancelled_task_uuids.clone(),
+                },
+            );
+        }
     }
 
     Ok(())
