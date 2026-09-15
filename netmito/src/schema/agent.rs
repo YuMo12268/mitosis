@@ -501,8 +501,21 @@ pub enum AgentNotification {
         current_suite_uuid: Uuid,
     },
 
-    /// The suite the agent is running was cancelled; stop and clean up.
-    SuiteCancelled { suite_uuid: Uuid, reason: String },
+    /// The suite the agent is running was cancelled. `graceful` stops claiming
+    /// and lets the tasks in hand and the cleanup hook finish; otherwise the
+    /// job is stopped outright.
+    ///
+    /// `graceful` is appended last and defaults to `false` when absent, so this
+    /// stays readable in both directions across an upgrade: older agents ignore
+    /// the trailing field, and newer ones treat an older coordinator's event as
+    /// the forced stop it used to mean.
+    SuiteCancelled {
+        suite_uuid: Uuid,
+        reason: String,
+        #[serde(default)]
+        #[speedy(default_on_eof)]
+        graceful: bool,
+    },
 
     /// Specific tasks were cancelled; stop executing them if in progress.
     TasksCancelled { task_uuids: Vec<Uuid> },

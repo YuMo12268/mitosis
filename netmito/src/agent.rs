@@ -587,10 +587,23 @@ impl AgentClient {
                     self.has_pending_suite = true;
                 }
             }
-            AgentNotification::SuiteCancelled { suite_uuid, reason } => {
+            AgentNotification::SuiteCancelled {
+                suite_uuid,
+                reason,
+                graceful,
+            } => {
                 if self.assigned_suite_uuid == Some(suite_uuid) {
-                    tracing::warn!("Suite {suite_uuid} was cancelled: {reason}");
-                    if let Some(token) = &self.job_token {
+                    tracing::warn!(
+                        "Suite {suite_uuid} was cancelled (graceful={graceful}): {reason}"
+                    );
+                    // Graceful only drains: cancelling the job token would also
+                    // kill the cleanup hook, which runs under it.
+                    let token = if graceful {
+                        &self.drain_token
+                    } else {
+                        &self.job_token
+                    };
+                    if let Some(token) = token {
                         token.cancel();
                     }
                 }
@@ -1179,10 +1192,12 @@ impl SuiteRunner {
     }
 
     /// One task slot: run what the keeper hands us, in `task-{slot}`, until the
-    /// channel closes.
+    /// channel closes or the job winds down.
     ///
-    /// No drain check of its own — a wind-down closes the channel, and the slot
-    /// finishes the task in hand before it notices.
+    /// A wind-down finishes only the task in hand. Closing the channel is not
+    /// enough for that: a receiver still gets what was queued before the close,
+    /// so the drain is checked ahead of every take, and anything left queued is
+    /// reclaimed by `complete`.
     async fn run_slot(
         &self,
         job: i64,
@@ -1193,7 +1208,10 @@ impl SuiteRunner {
         let dir = self.cache_path.join(format!("task-{slot}"));
         loop {
             let task = tokio::select! {
+                // Biased so a queued task never wins over a drain already set.
+                biased;
                 _ = self.job_token.cancelled() => break,
+                _ = self.drain_token.cancelled() => break,
                 task = task_rx.recv() => match task {
                     Ok(task) => task,
                     Err(_) => break,
@@ -1352,10 +1370,12 @@ impl SuiteRunner {
             .await
             .map_err(error::map_reqwest_err)?;
         // The suite going terminal under us is an ordinary end of run, not a
-        // failure: stop the loop and let cleanup proceed.
+        // failure: stop claiming and let cleanup proceed. Drain rather than
+        // cancel the job, which would kill the cleanup hook with it; a forced
+        // stop arrives on its own, and its task reports answer 400 anyway.
         if resp.status() == StatusCode::BAD_REQUEST {
             tracing::info!("Suite {suite_uuid} stopped handing out tasks");
-            self.job_token.cancel();
+            self.drain_token.cancel();
             return Ok(FetchTasksResp {
                 tasks: Vec::new(),
                 hold_job_open: false,

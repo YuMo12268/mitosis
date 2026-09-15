@@ -1110,6 +1110,7 @@ pub async fn user_cancel_task_suite(
     // Tear down whatever is still running. `Force` writes the terminal itself so
     // no further agent report is accepted; `Graceful` leaves the job alone and
     // lets the agent walk it through cleanup to `Completed`.
+    let graceful = matches!(op, CancelTaskSuiteOp::Graceful);
     let running_agents = match op {
         CancelTaskSuiteOp::Force => {
             let killed = pool
@@ -1137,6 +1138,7 @@ pub async fn user_cancel_task_suite(
             AgentNotification::SuiteCancelled {
                 suite_uuid,
                 reason: "Suite was cancelled by a user".to_string(),
+                graceful,
             },
         );
         if !cancelled_task_uuids.is_empty() {
