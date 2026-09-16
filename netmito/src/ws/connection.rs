@@ -26,7 +26,7 @@ use crate::schema::{AgentNotification, WsNotificationEvent};
 #[derive(Debug)]
 pub enum RouterOp {
     /// A WebSocket connected; attach its sender to the agent's session.
-    Register { uuid: Uuid, sender: MTx<Message> },
+    Register { uuid: Uuid, sender: Tx<Message> },
     /// The WebSocket dropped; the session and its buffer survive.
     Unregister { uuid: Uuid },
     /// The process that held this uuid is over — retired, or displaced by a
@@ -55,7 +55,7 @@ pub enum RouterOp {
 /// One agent's notification state.
 struct AgentSession {
     /// Sender of the live WebSocket, if any.
-    sender: Option<MTx<Message>>,
+    sender: Option<Tx<Message>>,
     /// Last allocated sequence ID.
     counter: u64,
     /// Notifications not yet acknowledged, oldest first.
@@ -143,10 +143,9 @@ impl AgentWsRouter {
                 // Replay whatever is still unacknowledged so a reconnecting
                 // agent catches up without waiting for a heartbeat.
                 let pending = session.pending_after(0);
-                let sender = session.sender.clone();
-                if let Some(sender) = sender {
+                if let Some(sender) = session.sender.as_ref() {
                     for event in &pending {
-                        if !Self::push_to_socket(&sender, event, uuid) {
+                        if !Self::push_to_socket(sender, event, uuid) {
                             break;
                         }
                     }
@@ -185,8 +184,8 @@ impl AgentWsRouter {
                 let Some(event) = session.push(event) else {
                     return;
                 };
-                if let Some(sender) = session.sender.clone() {
-                    Self::push_to_socket(&sender, &event, uuid);
+                if let Some(sender) = session.sender.as_ref() {
+                    Self::push_to_socket(sender, &event, uuid);
                 }
             }
             RouterOp::PendingNotifications {
@@ -209,7 +208,7 @@ impl AgentWsRouter {
         }
     }
 
-    fn push_to_socket(sender: &MTx<Message>, event: &WsNotificationEvent, uuid: Uuid) -> bool {
+    fn push_to_socket(sender: &Tx<Message>, event: &WsNotificationEvent, uuid: Uuid) -> bool {
         let payload = match event.write_to_vec() {
             Ok(payload) => payload,
             Err(e) => {
@@ -232,7 +231,7 @@ impl AgentWsRouter {
 
     // ── convenience senders, used from the service layer ──
 
-    pub fn register(tx: &MTx<RouterOp>, uuid: Uuid, sender: MTx<Message>) {
+    pub fn register(tx: &MTx<RouterOp>, uuid: Uuid, sender: Tx<Message>) {
         let _ = tx.send(RouterOp::Register { uuid, sender });
     }
 
@@ -263,8 +262,7 @@ impl AgentWsRouter {
         uuid: Uuid,
         ack_by_id: u64,
     ) -> Vec<WsNotificationEvent> {
-        let (resp_tx, resp_rx) =
-            crossfire::spsc::bounded_tx_blocking_rx_async::<Vec<WsNotificationEvent>>(1);
+        let (resp_tx, resp_rx) = crossfire::spsc::unbounded_async::<Vec<WsNotificationEvent>>();
         if tx
             .send(RouterOp::PendingNotifications {
                 uuid,
@@ -279,7 +277,7 @@ impl AgentWsRouter {
     }
 
     pub async fn counter(tx: &MTx<RouterOp>, uuid: Uuid) -> Option<u64> {
-        let (resp_tx, resp_rx) = crossfire::spsc::bounded_tx_blocking_rx_async::<Option<u64>>(1);
+        let (resp_tx, resp_rx) = crossfire::spsc::unbounded_async::<Option<u64>>();
         if tx.send(RouterOp::GetCounter { uuid, tx: resp_tx }).is_err() {
             return None;
         }

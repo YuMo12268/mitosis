@@ -432,7 +432,7 @@ impl Executor {
             .await?;
 
         // Compress possible output and upload
-        let (tx, rx) = crossfire::mpmc::bounded_async::<(ArtifactContentType, u64)>(3);
+        let (tx, rx) = crossfire::spsc::unbounded_async::<(ArtifactContentType, u64)>();
         // Spawn a task to archive the output
         let timeout_cancel_token = CancellationToken::new();
         let archive_timeout_cancel_token = timeout_cancel_token.clone();
@@ -477,7 +477,7 @@ impl Executor {
                                 encoder.shutdown().await?;
                                 let file = encoder.into_inner();
                                 let size = file.metadata().await?.len();
-                                if let Err(e) = tx.send((ArtifactContentType::Result, size)).await {
+                                if let Err(e) = tx.send((ArtifactContentType::Result, size)) {
                                     tracing::error!("Failed to send result size: {}", e);
                                     archive_cancel_token.cancel();
                                     return Ok(());
@@ -533,7 +533,7 @@ impl Executor {
                                 encoder.shutdown().await?;
                                 let file = encoder.into_inner();
                                 let size = file.metadata().await?.len();
-                                if let Err(e) = tx.send((ArtifactContentType::ExecLog, size)).await {
+                                if let Err(e) = tx.send((ArtifactContentType::ExecLog, size)) {
                                     tracing::error!("Failed to compress exec log: {}", e);
                                     archive_cancel_token.cancel();
                                     return Ok(());
@@ -592,7 +592,7 @@ impl Executor {
                                 encoder.shutdown().await?;
                                 let file = encoder.into_inner();
                                 let size = file.metadata().await?.len();
-                                if let Err(e) = tx.send((ArtifactContentType::StdLog, size)).await {
+                                if let Err(e) = tx.send((ArtifactContentType::StdLog, size)) {
                                     tracing::error!("Failed to compress std log: {}", e);
                                     archive_cancel_token.cancel();
                                     return Ok(());
@@ -613,6 +613,7 @@ impl Executor {
             Ok(())
         });
         let upload_artifact_fut = async {
+            let rx = rx;
             while let Ok((content_type, content_length)) = rx.recv().await {
                 let url = match self
                     .client

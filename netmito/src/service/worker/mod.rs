@@ -517,7 +517,7 @@ pub async fn fetch_task(
     pool: &InfraPool,
 ) -> crate::error::Result<Option<WorkerTaskResp>> {
     loop {
-        let (tx, rx) = crossfire::spsc::bounded_tx_blocking_rx_async::<Option<i64>>(1);
+        let (tx, rx) = crossfire::spsc::unbounded_async::<Option<i64>>();
         if pool
             .worker_task_queue_tx
             .send(TaskDispatcherOp::FetchTask(worker_id, tx))
