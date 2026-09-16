@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 
-use crossfire::{MAsyncRx, MAsyncTx};
+use crossfire::{AsyncTx, MAsyncRx, MAsyncTx};
 use futures::{SinkExt as _, StreamExt as _};
 use reqwest::StatusCode;
 use speedy::{Readable as _, Writable as _};
@@ -394,7 +394,7 @@ impl AgentClient {
         // The channel is built either way: `select!` evaluates a branch's
         // expression even when its guard is false, so `ws_rx` has to exist.
         let ws_enabled = !self.no_ws;
-        let (ws_tx, ws_rx) = crossfire::mpsc::bounded_async::<WsNotificationEvent>(32);
+        let (ws_tx, ws_rx) = crossfire::spsc::bounded_async::<WsNotificationEvent>(32);
         let ws_handle = if ws_enabled {
             Some(self.spawn_websocket_client(ws_tx, cancel_token.clone()))
         } else {
@@ -482,6 +482,7 @@ impl AgentClient {
             }
         }
 
+        drop(ws_rx);
         // Let the in-flight suite drain so its last reports land.
         if let Some(handle) = self.current_run.take() {
             let _ = handle.await;
@@ -495,7 +496,7 @@ impl AgentClient {
 
     fn spawn_websocket_client(
         &self,
-        notification_tx: MAsyncTx<WsNotificationEvent>,
+        mut notification_tx: AsyncTx<WsNotificationEvent>,
         cancel_token: CancellationToken,
     ) -> JoinHandle<()> {
         let mut url = self.coordinator_addr.clone();
@@ -508,7 +509,7 @@ impl AgentClient {
         tokio::spawn(async move {
             while !cancel_token.is_cancelled() {
                 tracing::debug!("Connecting to {ws_url}");
-                match Self::websocket_session(&ws_url, &token, &notification_tx, &cancel_token)
+                match Self::websocket_session(&ws_url, &token, &mut notification_tx, &cancel_token)
                     .await
                 {
                     Ok(()) => tracing::debug!("Agent WebSocket closed"),
@@ -807,7 +808,7 @@ impl AgentClient {
     async fn websocket_session(
         ws_url: &str,
         token: &str,
-        notification_tx: &MAsyncTx<WsNotificationEvent>,
+        notification_tx: &mut AsyncTx<WsNotificationEvent>,
         cancel_token: &CancellationToken,
     ) -> Result<()> {
         let host = Url::parse(ws_url)
@@ -855,7 +856,12 @@ impl AgentClient {
                         }
                     };
                     let id = event.id;
-                    if notification_tx.send(event).await.is_err() {
+                    let send_result = tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => return Ok(()),
+                        result = notification_tx.send(event) => result,
+                    };
+                    if send_result.is_err() {
                         return Ok(());
                     }
                     // Acknowledge only once the main loop has taken it, so an event

@@ -33,7 +33,7 @@ pub async fn websocket_handler(
 
 async fn handle_agent_socket(socket: WebSocket, agent_uuid: Uuid, pool: InfraPool) {
     let (mut sender, mut receiver) = socket.split();
-    let (tx, rx) = crossfire::mpsc::unbounded_async::<Message>();
+    let (tx, rx) = crossfire::spsc::unbounded_async::<Message>();
 
     AgentWsRouter::register(&pool.ws_router_tx, agent_uuid, tx);
 
